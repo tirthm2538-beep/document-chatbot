@@ -1,8 +1,7 @@
 import os
 import time
-import chromadb
+import numpy as np
 import streamlit as st
-from pypdf import PdfReader
 from google import genai
 from dotenv import load_dotenv
 
@@ -18,36 +17,23 @@ MODELS = [
     "gemini-flash-lite-latest",
 ]
 
-def chunk_text(text, size=1000, overlap=200):
-    chunks = []
-    start = 0
-    while start < len(text):
-        chunks.append(text[start:start + size])
-        start += size - overlap
-    return chunks
-
 @st.cache_resource
-def build_database():
-    db = chromadb.PersistentClient(path="chroma_db")
-    collection = db.get_or_create_collection("docs")
-    if collection.count() > 0:
-        return collection
-    for filename in os.listdir("docs"):
-        if not filename.endswith(".pdf"):
-            continue
-        reader = PdfReader(os.path.join("docs", filename))
-        text = " ".join(page.extract_text() or "" for page in reader.pages)
-        for i, chunk in enumerate(chunk_text(text)):
-            result = client.models.embed_content(
-                model="gemini-embedding-001", contents=chunk
+def load_index():
+    data = np.load("index.npz")
+    vectors = data["vectors"].astype("float32")
+    vectors = vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
+    return vectors, data["texts"], data["sources"]
+
+def embed_question(question):
+    for attempt in range(4):
+        try:
+            r = client.models.embed_content(
+                model="gemini-embedding-001", contents=question
             )
-            collection.add(
-                ids=[f"{filename}-{i}"],
-                embeddings=[result.embeddings[0].values],
-                documents=[chunk],
-                metadatas=[{"source": filename}],
-            )
-    return collection
+            return np.array(r.embeddings[0].values, dtype="float32")
+        except Exception:
+            time.sleep(3)
+    return None
 
 def generate_with_retry(prompt):
     for model in MODELS:
@@ -64,8 +50,7 @@ def generate_with_retry(prompt):
 st.title("Document Chatbot")
 st.caption("Ask questions about my documents")
 
-with st.spinner("Getting the documents ready..."):
-    collection = build_database()
+vectors, texts, source_names = load_index()
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -81,27 +66,26 @@ if question:
     with st.chat_message("user"):
         st.write(question)
 
+    busy = "The AI service is very busy right now. Please try again in a moment."
+    answer = busy
+
     with st.spinner("Thinking..."):
-        q = client.models.embed_content(
-            model="gemini-embedding-001", contents=question
-        )
-        results = collection.query(
-            query_embeddings=[q.embeddings[0].values], n_results=4
-        )
-        context = "\n\n".join(results["documents"][0])
-        sources = sorted({m["source"] for m in results["metadatas"][0]})
+        q = embed_question(question)
+        if q is not None:
+            q = q / np.linalg.norm(q)
+            scores = vectors @ q
+            top = np.argsort(scores)[::-1][:4]
+            context = "\n\n".join(str(texts[i]) for i in top)
+            sources = sorted({str(source_names[i]) for i in top})
 
-        prompt = (
-            "Answer the question using only the context below. "
-            "If the answer is not in the context, say you don't know.\n\n"
-            f"Context:\n{context}\n\nQuestion: {question}"
-        )
-        text = generate_with_retry(prompt)
-
-    if text is None:
-        answer = "The AI service is very busy right now. Please try again in a moment."
-    else:
-        answer = text + "\n\nSources: " + ", ".join(sources)
+            prompt = (
+                "Answer the question using only the context below. "
+                "If the answer is not in the context, say you don't know.\n\n"
+                f"Context:\n{context}\n\nQuestion: {question}"
+            )
+            text = generate_with_retry(prompt)
+            if text is not None:
+                answer = text + "\n\nSources: " + ", ".join(sources)
 
     st.session_state.messages.append({"role": "assistant", "content": answer})
     with st.chat_message("assistant"):

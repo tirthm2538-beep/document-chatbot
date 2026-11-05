@@ -2,13 +2,13 @@ import os
 import time
 import chromadb
 import streamlit as st
+from pypdf import PdfReader
 from google import genai
 from dotenv import load_dotenv
 
 load_dotenv()
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-db = chromadb.PersistentClient(path="chroma_db")
-collection = db.get_or_create_collection("docs")
+API_KEY = os.getenv("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY")
+client = genai.Client(api_key=API_KEY)
 
 MODELS = [
     "gemini-flash-latest",
@@ -17,6 +17,37 @@ MODELS = [
     "gemini-3.1-flash-lite",
     "gemini-flash-lite-latest",
 ]
+
+def chunk_text(text, size=1000, overlap=200):
+    chunks = []
+    start = 0
+    while start < len(text):
+        chunks.append(text[start:start + size])
+        start += size - overlap
+    return chunks
+
+@st.cache_resource
+def build_database():
+    db = chromadb.PersistentClient(path="chroma_db")
+    collection = db.get_or_create_collection("docs")
+    if collection.count() > 0:
+        return collection
+    for filename in os.listdir("docs"):
+        if not filename.endswith(".pdf"):
+            continue
+        reader = PdfReader(os.path.join("docs", filename))
+        text = " ".join(page.extract_text() or "" for page in reader.pages)
+        for i, chunk in enumerate(chunk_text(text)):
+            result = client.models.embed_content(
+                model="gemini-embedding-001", contents=chunk
+            )
+            collection.add(
+                ids=[f"{filename}-{i}"],
+                embeddings=[result.embeddings[0].values],
+                documents=[chunk],
+                metadatas=[{"source": filename}],
+            )
+    return collection
 
 def generate_with_retry(prompt):
     for model in MODELS:
@@ -32,6 +63,9 @@ def generate_with_retry(prompt):
 
 st.title("Document Chatbot")
 st.caption("Ask questions about my documents")
+
+with st.spinner("Getting the documents ready..."):
+    collection = build_database()
 
 if "messages" not in st.session_state:
     st.session_state.messages = []

@@ -3,16 +3,18 @@ import time
 import numpy as np
 import streamlit as st
 from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 
 load_dotenv()
 API_KEY = os.getenv("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY")
-client = genai.Client(api_key=API_KEY)
+client = genai.Client(
+    api_key=API_KEY,
+    http_options=types.HttpOptions(timeout=20000),
+)
 
 MODELS = [
     "gemini-flash-latest",
-    "gemini-3.7-flash",
-    "gemini-3.5-flash",
     "gemini-3.1-flash-lite",
     "gemini-flash-lite-latest",
 ]
@@ -25,27 +27,28 @@ def load_index():
     return vectors, data["texts"], data["sources"]
 
 def embed_question(question):
-    for attempt in range(4):
-        try:
-            r = client.models.embed_content(
-                model="gemini-embedding-001", contents=question
-            )
-            return np.array(r.embeddings[0].values, dtype="float32")
-        except Exception:
-            time.sleep(3)
-    return None
+    try:
+        r = client.models.embed_content(
+            model="gemini-embedding-001", contents=question
+        )
+        return np.array(r.embeddings[0].values, dtype="float32"), None
+    except Exception as e:
+        return None, f"Embedding step failed: {str(e)[:200]}"
 
 def generate_with_retry(prompt):
+    start = time.time()
+    last_error = None
     for model in MODELS:
-        for attempt in range(2):
-            try:
-                reply = client.models.generate_content(
-                    model=model, contents=prompt
-                )
-                return reply.text
-            except Exception:
-                time.sleep(2)
-    return None
+        if time.time() - start > 45:
+            break
+        try:
+            reply = client.models.generate_content(
+                model=model, contents=prompt
+            )
+            return reply.text, None
+        except Exception as e:
+            last_error = f"{model} failed: {str(e)[:200]}"
+    return None, last_error
 
 st.title("Document Chatbot")
 st.caption("Ask questions about my documents")
@@ -66,11 +69,11 @@ if question:
     with st.chat_message("user"):
         st.write(question)
 
-    busy = "The AI service is very busy right now. Please try again in a moment."
-    answer = busy
+    answer = "Sorry, the AI service did not respond. Please try again in a moment."
+    error_note = None
 
     with st.spinner("Thinking..."):
-        q = embed_question(question)
+        q, error_note = embed_question(question)
         if q is not None:
             q = q / np.linalg.norm(q)
             scores = vectors @ q
@@ -83,10 +86,12 @@ if question:
                 "If the answer is not in the context, say you don't know.\n\n"
                 f"Context:\n{context}\n\nQuestion: {question}"
             )
-            text = generate_with_retry(prompt)
+            text, error_note = generate_with_retry(prompt)
             if text is not None:
                 answer = text + "\n\nSources: " + ", ".join(sources)
 
     st.session_state.messages.append({"role": "assistant", "content": answer})
     with st.chat_message("assistant"):
         st.write(answer)
+        if error_note and answer.startswith("Sorry"):
+            st.caption(error_note)

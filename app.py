@@ -2,6 +2,7 @@ import os
 import time
 import numpy as np
 import streamlit as st
+from pypdf import PdfReader
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
@@ -12,7 +13,7 @@ load_dotenv()
 API_KEY = os.getenv("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY")
 client = genai.Client(
     api_key=API_KEY,
-    http_options=types.HttpOptions(timeout=20000),
+    http_options=types.HttpOptions(timeout=30000),
 )
 
 MODELS = [
@@ -20,6 +21,8 @@ MODELS = [
     "gemini-3.1-flash-lite",
     "gemini-flash-lite-latest",
 ]
+MAX_CHUNKS = 120
+BATCH_SIZE = 20
 
 st.markdown(
     """
@@ -56,6 +59,52 @@ def load_index():
     return vectors, data["texts"], data["sources"]
 
 
+def chunk_text(text, size=1000, overlap=200):
+    chunks = []
+    start = 0
+    while start < len(text):
+        chunks.append(text[start:start + size])
+        start += size - overlap
+    return chunks
+
+
+def embed_batch(chunks):
+    for attempt in range(3):
+        try:
+            r = client.models.embed_content(
+                model="gemini-embedding-001", contents=chunks
+            )
+            return [e.values for e in r.embeddings]
+        except Exception:
+            time.sleep(5)
+    return None
+
+
+def process_upload(uploaded, progress):
+    reader = PdfReader(uploaded)
+    text = " ".join(page.extract_text() or "" for page in reader.pages)
+    if not text.strip():
+        return None, "No readable text found. Scanned PDFs are not supported."
+    chunks = chunk_text(text)[:MAX_CHUNKS]
+    vectors = []
+    for i in range(0, len(chunks), BATCH_SIZE):
+        batch = chunks[i:i + BATCH_SIZE]
+        result = embed_batch(batch)
+        if result is None:
+            return None, "Google was busy while reading the file. Please try again."
+        vectors.extend(result)
+        progress.progress(min(1.0, (i + BATCH_SIZE) / len(chunks)))
+        time.sleep(1)
+    arr = np.array(vectors, dtype="float32")
+    arr = arr / np.linalg.norm(arr, axis=1, keepdims=True)
+    return {
+        "name": uploaded.name,
+        "vectors": arr,
+        "texts": np.array(chunks),
+        "sources": np.array([uploaded.name] * len(chunks)),
+    }, None
+
+
 def embed_question(question):
     try:
         r = client.models.embed_content(
@@ -80,8 +129,8 @@ def generate_with_retry(prompt):
     return None, last_error
 
 
-vectors, texts, source_names = load_index()
-doc_names = sorted({str(s) for s in source_names})
+b_vectors, b_texts, b_sources = load_index()
+builtin_names = sorted({str(s) for s in b_sources})
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -93,16 +142,40 @@ with st.sidebar:
         "An AI assistant that answers questions using only your documents, "
         "and shows where every answer came from."
     )
+
+    st.subheader("📤 Upload your own PDF")
+    uploaded = st.file_uploader("Drop a PDF here", type="pdf")
+    if uploaded is None:
+        st.session_state.pop("custom", None)
+    elif st.session_state.get("custom", {}).get("name") != uploaded.name:
+        bar = st.progress(0.0, text="Reading your document...")
+        custom, err = process_upload(uploaded, bar)
+        bar.empty()
+        if err:
+            st.error(err)
+        else:
+            st.session_state["custom"] = custom
+            st.success(f"Ready: {custom['name']}")
+
+    custom = st.session_state.get("custom")
+    scope = "Built-in documents"
+    if custom:
+        scope = st.radio(
+            "Search in",
+            ["My uploaded document", "Built-in documents", "Both"],
+        )
+
     st.subheader("📄 Loaded documents")
-    for name in doc_names:
+    if custom:
+        st.write(f"• {custom['name']} (yours)")
+    for name in builtin_names:
         st.write(f"• {name}")
-    st.caption(f"{len(texts)} searchable passages")
 
     st.subheader("💡 Try asking")
     examples = [
-        "Summarize the main idea of these documents",
+        "Summarize the main idea of this document",
         "What are the key findings?",
-        "What problem do these documents try to solve?",
+        "What problem does this document try to solve?",
     ]
     for ex in examples:
         if st.button(ex, use_container_width=True):
@@ -125,7 +198,7 @@ st.markdown(
 )
 
 if not st.session_state.messages:
-    st.info("👈 Pick an example question in the sidebar, or type your own below.")
+    st.info("👈 Upload a PDF or pick an example question in the sidebar, or type your own below.")
 
 
 def show_message(m):
@@ -149,6 +222,19 @@ if question:
     user_msg = {"role": "user", "content": question}
     st.session_state.messages.append(user_msg)
     show_message(user_msg)
+
+    parts_v, parts_t, parts_s = [], [], []
+    if custom and scope in ("My uploaded document", "Both"):
+        parts_v.append(custom["vectors"])
+        parts_t.append(custom["texts"])
+        parts_s.append(custom["sources"])
+    if (not custom) or scope in ("Built-in documents", "Both"):
+        parts_v.append(b_vectors)
+        parts_t.append(b_texts)
+        parts_s.append(b_sources)
+    vectors = np.concatenate(parts_v)
+    texts = np.concatenate(parts_t)
+    source_names = np.concatenate(parts_s)
 
     answer = "Sorry, the AI service did not respond. Please try again in a moment."
     sources = []

@@ -1,3 +1,4 @@
+import base64
 import os
 import time
 import numpy as np
@@ -103,7 +104,9 @@ def sign_out():
         pass
     st.session_state.user = None
     st.session_state.messages = []
-    st.session_state.pop("custom", None)
+    st.session_state.pop("my_docs", None)
+    st.session_state.pop("docs_error", None)
+    st.session_state.handled_files = set()
 
 
 # ---------- Login gate ----------
@@ -201,6 +204,16 @@ def chunk_text(text, size=1000, overlap=200):
     return chunks
 
 
+def encode_vec(vec):
+    arr = np.asarray(vec, dtype="float16")
+    return base64.b64encode(arr.tobytes()).decode("ascii")
+
+
+def decode_vec(text):
+    raw = base64.b64decode(text)
+    return np.frombuffer(raw, dtype="float16").astype("float32")
+
+
 def embed_batch(chunks):
     for attempt in range(3):
         try:
@@ -217,7 +230,7 @@ def process_upload(uploaded, progress):
     reader = PdfReader(uploaded)
     chunks, chunk_pages = [], []
     for page_number, page in enumerate(reader.pages, start=1):
-        page_text = page.extract_text() or ""
+        page_text = (page.extract_text() or "").replace("\x00", "")
         if not page_text.strip():
             continue
         for chunk in chunk_text(page_text):
@@ -232,19 +245,110 @@ def process_upload(uploaded, progress):
         batch = chunks[i:i + BATCH_SIZE]
         result = embed_batch(batch)
         if result is None:
-            return None, "Google was busy while reading the file. Please try again."
+            return None, "Google was busy while reading the file. Remove the file and upload it again in a minute."
         vectors.extend(result)
         progress.progress(min(1.0, (i + BATCH_SIZE) / len(chunks)))
         time.sleep(1)
-    arr = np.array(vectors, dtype="float32")
-    arr = arr / np.linalg.norm(arr, axis=1, keepdims=True)
     return {
         "name": uploaded.name,
-        "vectors": arr,
-        "texts": np.array(chunks),
-        "sources": np.array([uploaded.name] * len(chunks)),
-        "pages": np.array(chunk_pages),
+        "texts": chunks,
+        "pages": chunk_pages,
+        "vectors": np.array(vectors, dtype="float32"),
     }, None
+
+
+def delete_document(doc_id):
+    try:
+        supabase.table("documents").delete().eq("id", doc_id).execute()
+        return None
+    except Exception as e:
+        return str(e)[:150]
+
+
+def save_document(doc):
+    try:
+        res = (
+            supabase.table("documents")
+            .insert({"name": doc["name"], "chunk_count": len(doc["texts"])})
+            .execute()
+        )
+        doc_id = res.data[0]["id"]
+    except Exception as e:
+        return str(e)[:150]
+    try:
+        total = len(doc["texts"])
+        for i in range(0, total, 20):
+            rows = []
+            for j in range(i, min(i + 20, total)):
+                rows.append(
+                    {
+                        "document_id": doc_id,
+                        "page": int(doc["pages"][j]),
+                        "content": doc["texts"][j],
+                        "embedding": encode_vec(doc["vectors"][j]),
+                    }
+                )
+            supabase.table("chunks").insert(rows).execute()
+    except Exception as e:
+        delete_document(doc_id)
+        return str(e)[:150]
+    return None
+
+
+def load_my_documents():
+    try:
+        docs = (
+            supabase.table("documents")
+            .select("id,name")
+            .order("created_at")
+            .execute()
+            .data
+        )
+        if not docs:
+            return [], None
+        rows = []
+        start = 0
+        while True:
+            batch = (
+                supabase.table("chunks")
+                .select("document_id,page,content,embedding")
+                .order("id")
+                .range(start, start + 999)
+                .execute()
+                .data
+            )
+            rows.extend(batch)
+            if len(batch) < 1000:
+                break
+            start += 1000
+    except Exception as e:
+        return [], str(e)[:150]
+
+    by_doc = {}
+    for r in rows:
+        by_doc.setdefault(r["document_id"], []).append(r)
+
+    result = []
+    for d in docs:
+        items = by_doc.get(d["id"], [])
+        if not items:
+            continue
+        vecs = np.array([decode_vec(r["embedding"]) for r in items], dtype="float32")
+        vecs = vecs / np.linalg.norm(vecs, axis=1, keepdims=True)
+        result.append(
+            {
+                "id": d["id"],
+                "name": d["name"],
+                "vectors": vecs,
+                "texts": np.array([r["content"] for r in items]),
+                "pages": np.array([r["page"] or 0 for r in items]),
+            }
+        )
+    return result, None
+
+
+def refresh_documents():
+    st.session_state.my_docs, st.session_state.docs_error = load_my_documents()
 
 
 def embed_question(question):
@@ -284,6 +388,12 @@ builtin_names = sorted({str(s) for s in b_sources})
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "handled_files" not in st.session_state:
+    st.session_state.handled_files = set()
+if "my_docs" not in st.session_state:
+    with st.spinner("Loading your documents..."):
+        refresh_documents()
+my_docs = st.session_state.my_docs
 
 # ---------- Sidebar ----------
 with st.sidebar:
@@ -305,28 +415,49 @@ with st.sidebar:
     st.subheader("📤 Upload your own PDF")
     uploaded = st.file_uploader("Drop a PDF here", type="pdf")
     if uploaded is None:
-        st.session_state.pop("custom", None)
-    elif st.session_state.get("custom", {}).get("name") != uploaded.name:
-        bar = st.progress(0.0, text="Reading your document...")
-        custom, err = process_upload(uploaded, bar)
-        bar.empty()
-        if err:
-            st.error(err)
-        else:
-            st.session_state["custom"] = custom
-            st.success(f"Ready: {custom['name']}")
+        st.session_state.handled_files = set()
+    else:
+        file_key = f"{uploaded.name}-{uploaded.size}"
+        if file_key not in st.session_state.handled_files:
+            st.session_state.handled_files.add(file_key)
+            if any(d["name"] == uploaded.name for d in my_docs):
+                st.info("You already saved this document.")
+            else:
+                bar = st.progress(0.0, text="Reading your document...")
+                doc, err = process_upload(uploaded, bar)
+                bar.empty()
+                if err:
+                    st.error(err)
+                else:
+                    save_err = save_document(doc)
+                    if save_err:
+                        st.error(f"Could not save the document: {save_err}")
+                    else:
+                        st.success(f"Saved: {doc['name']} ({len(doc['texts'])} passages)")
+                        refresh_documents()
+                        my_docs = st.session_state.my_docs
 
-    custom = st.session_state.get("custom")
     scope = "Built-in documents"
-    if custom:
+    if my_docs:
         scope = st.radio(
             "Search in",
-            ["My uploaded document", "Built-in documents", "Both"],
+            ["My documents", "Built-in documents", "Both"],
+            index=2,
         )
 
-    st.subheader("📄 Loaded documents")
-    if custom:
-        st.write(f"• {custom['name']} (yours)")
+    st.subheader("📄 Documents")
+    if st.session_state.get("docs_error"):
+        st.caption("Could not load your documents: " + st.session_state["docs_error"])
+    for d in my_docs:
+        c1, c2 = st.columns([5, 1])
+        c1.write(f"• {d['name']} (yours)")
+        if c2.button("🗑️", key=f"del-{d['id']}"):
+            del_err = delete_document(d["id"])
+            if del_err:
+                st.error(f"Could not delete: {del_err}")
+            else:
+                refresh_documents()
+                st.rerun()
     for name in builtin_names:
         st.write(f"• {name}")
 
@@ -382,12 +513,13 @@ if question:
     show_message(user_msg)
 
     parts_v, parts_t, parts_s, parts_p = [], [], [], []
-    if custom and scope in ("My uploaded document", "Both"):
-        parts_v.append(custom["vectors"])
-        parts_t.append(custom["texts"])
-        parts_s.append(custom["sources"])
-        parts_p.append(custom["pages"])
-    if (not custom) or scope in ("Built-in documents", "Both"):
+    if my_docs and scope in ("My documents", "Both"):
+        for d in my_docs:
+            parts_v.append(d["vectors"])
+            parts_t.append(d["texts"])
+            parts_s.append(np.array([d["name"]] * len(d["texts"])))
+            parts_p.append(d["pages"])
+    if (not my_docs) or scope in ("Built-in documents", "Both"):
         parts_v.append(b_vectors)
         parts_t.append(b_texts)
         parts_s.append(b_sources)

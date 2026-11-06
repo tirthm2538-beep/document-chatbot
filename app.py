@@ -110,6 +110,20 @@ if not st.session_state.user:
 user = st.session_state.user
 
 
+def log_question(question, answered):
+    try:
+        supabase.table("questions").insert(
+            {
+                "user_email": user.email,
+                "question": question,
+                "answered": answered,
+            }
+        ).execute()
+        st.session_state.pop("log_error", None)
+    except Exception as e:
+        st.session_state["log_error"] = str(e)[:150]
+
+
 @st.cache_resource
 def load_index():
     data = np.load("index.npz")
@@ -248,6 +262,8 @@ with st.sidebar:
     st.divider()
     if st.button("🗑️ Clear chat", use_container_width=True):
         st.session_state.messages = []
+    if st.session_state.get("log_error"):
+        st.caption("Could not save question: " + st.session_state["log_error"])
     st.caption("Built by Tirth · Python, Gemini, Streamlit")
 
 # ---------- Header ----------
@@ -315,6 +331,8 @@ if question:
                 answer = text
                 sources = found
                 error_note = None
+
+    log_question(question, bool(sources))
 
     bot_msg = {
         "role": "assistant",

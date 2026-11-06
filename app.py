@@ -1,6 +1,7 @@
 import os
 import time
 import numpy as np
+import pandas as pd
 import streamlit as st
 from pypdf import PdfReader
 from supabase import create_client
@@ -24,6 +25,19 @@ if "sb" not in st.session_state:
 supabase = st.session_state.sb
 if "user" not in st.session_state:
     st.session_state.user = None
+
+
+def get_secret(name):
+    value = os.getenv(name)
+    if value:
+        return value
+    try:
+        return st.secrets.get(name)
+    except Exception:
+        return None
+
+
+ADMIN_EMAIL = (get_secret("ADMIN_EMAIL") or "").strip().lower()
 
 MODELS = [
     "gemini-flash-latest",
@@ -108,6 +122,7 @@ if not st.session_state.user:
     st.stop()
 
 user = st.session_state.user
+is_admin = bool(ADMIN_EMAIL) and (user.email or "").lower() == ADMIN_EMAIL
 
 
 def log_question(question, answered):
@@ -122,6 +137,46 @@ def log_question(question, answered):
         st.session_state.pop("log_error", None)
     except Exception as e:
         st.session_state["log_error"] = str(e)[:150]
+
+
+def show_admin():
+    st.markdown(HERO, unsafe_allow_html=True)
+    st.subheader("📊 Admin dashboard")
+    try:
+        rows = (
+            supabase.table("questions")
+            .select("*")
+            .order("created_at", desc=True)
+            .limit(500)
+            .execute()
+            .data
+        )
+    except Exception as e:
+        st.error(f"Could not load questions: {str(e)[:200]}")
+        return
+    if not rows:
+        st.info("No questions have been asked yet.")
+        return
+
+    df = pd.DataFrame(rows)
+    df["created_at"] = pd.to_datetime(df["created_at"])
+    answered_count = int(df["answered"].fillna(False).astype(bool).sum())
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total questions", len(df))
+    c2.metric("Answered", answered_count)
+    c3.metric("Users", df["user_email"].nunique())
+
+    st.subheader("Questions per day")
+    per_day = df.groupby(df["created_at"].dt.date).size()
+    st.bar_chart(per_day)
+
+    st.subheader("Recent questions")
+    st.dataframe(
+        df[["created_at", "user_email", "question", "answered"]],
+        use_container_width=True,
+        hide_index=True,
+    )
 
 
 @st.cache_resource
@@ -216,6 +271,10 @@ with st.sidebar:
         sign_out()
         st.rerun()
 
+    view = "Chat"
+    if is_admin:
+        view = st.radio("View", ["Chat", "Admin"], horizontal=True)
+
     st.write(
         "An AI assistant that answers questions using only your documents, "
         "and shows where every answer came from."
@@ -265,6 +324,11 @@ with st.sidebar:
     if st.session_state.get("log_error"):
         st.caption("Could not save question: " + st.session_state["log_error"])
     st.caption("Built by Tirth · Python, Gemini, Streamlit")
+
+# ---------- Admin view ----------
+if view == "Admin":
+    show_admin()
+    st.stop()
 
 # ---------- Header ----------
 st.markdown(HERO, unsafe_allow_html=True)

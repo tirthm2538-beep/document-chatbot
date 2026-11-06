@@ -3,3 +3,4 @@ numpy
 pypdf
 python-dotenv
 streamlit
+supabase

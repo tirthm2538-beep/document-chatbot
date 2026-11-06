@@ -3,6 +3,7 @@ import time
 import numpy as np
 import streamlit as st
 from pypdf import PdfReader
+from supabase import create_client
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
@@ -15,6 +16,14 @@ client = genai.Client(
     api_key=API_KEY,
     http_options=types.HttpOptions(timeout=30000),
 )
+
+SUPABASE_URL = os.getenv("SUPABASE_URL") or st.secrets.get("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY") or st.secrets.get("SUPABASE_KEY")
+if "sb" not in st.session_state:
+    st.session_state.sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+supabase = st.session_state.sb
+if "user" not in st.session_state:
+    st.session_state.user = None
 
 MODELS = [
     "gemini-flash-latest",
@@ -49,6 +58,56 @@ footer {visibility: hidden;}
 """,
     unsafe_allow_html=True,
 )
+
+HERO = """
+<div class="hero">
+  <h1>🧠 DocuMind AI</h1>
+  <p>Ask anything about your documents. Get answers with sources.</p>
+</div>
+"""
+
+
+def authenticate(mode, email, password):
+    try:
+        if mode == "Sign up":
+            res = supabase.auth.sign_up({"email": email, "password": password})
+        else:
+            res = supabase.auth.sign_in_with_password(
+                {"email": email, "password": password}
+            )
+    except Exception as e:
+        return None, str(e)[:200]
+    if res.user and res.session:
+        return res.user, None
+    return None, "Account created. Check your email to confirm it, then log in."
+
+
+def sign_out():
+    try:
+        supabase.auth.sign_out()
+    except Exception:
+        pass
+    st.session_state.user = None
+    st.session_state.messages = []
+    st.session_state.pop("custom", None)
+
+
+# ---------- Login gate ----------
+if not st.session_state.user:
+    st.markdown(HERO, unsafe_allow_html=True)
+    mode = st.radio("Welcome", ["Log in", "Sign up"], horizontal=True)
+    login_email = st.text_input("Email")
+    login_password = st.text_input("Password (at least 6 characters)", type="password")
+    if st.button(mode, type="primary"):
+        new_user, message = authenticate(mode, login_email, login_password)
+        if new_user:
+            st.session_state.user = new_user
+            st.rerun()
+        else:
+            st.warning(message)
+    st.stop()
+
+user = st.session_state.user
 
 
 @st.cache_resource
@@ -138,6 +197,11 @@ if "messages" not in st.session_state:
 # ---------- Sidebar ----------
 with st.sidebar:
     st.header("🧠 DocuMind AI")
+    st.caption(f"Signed in as {user.email}")
+    if st.button("Log out", use_container_width=True):
+        sign_out()
+        st.rerun()
+
     st.write(
         "An AI assistant that answers questions using only your documents, "
         "and shows where every answer came from."
@@ -187,15 +251,7 @@ with st.sidebar:
     st.caption("Built by Tirth · Python, Gemini, Streamlit")
 
 # ---------- Header ----------
-st.markdown(
-    """
-<div class="hero">
-  <h1>🧠 DocuMind AI</h1>
-  <p>Ask anything about your documents. Get answers with sources.</p>
-</div>
-""",
-    unsafe_allow_html=True,
-)
+st.markdown(HERO, unsafe_allow_html=True)
 
 if not st.session_state.messages:
     st.info("👈 Upload a PDF or pick an example question in the sidebar, or type your own below.")

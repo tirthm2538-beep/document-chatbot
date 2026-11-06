@@ -184,7 +184,12 @@ def load_index():
     data = np.load("index.npz")
     vectors = data["vectors"].astype("float32")
     vectors = vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
-    return vectors, data["texts"], data["sources"]
+    texts = data["texts"]
+    if "pages" in data.files:
+        pages = data["pages"]
+    else:
+        pages = np.zeros(len(texts), dtype=int)
+    return vectors, texts, data["sources"], pages
 
 
 def chunk_text(text, size=1000, overlap=200):
@@ -210,10 +215,18 @@ def embed_batch(chunks):
 
 def process_upload(uploaded, progress):
     reader = PdfReader(uploaded)
-    text = " ".join(page.extract_text() or "" for page in reader.pages)
-    if not text.strip():
+    chunks, chunk_pages = [], []
+    for page_number, page in enumerate(reader.pages, start=1):
+        page_text = page.extract_text() or ""
+        if not page_text.strip():
+            continue
+        for chunk in chunk_text(page_text):
+            chunks.append(chunk)
+            chunk_pages.append(page_number)
+    if not chunks:
         return None, "No readable text found. Scanned PDFs are not supported."
-    chunks = chunk_text(text)[:MAX_CHUNKS]
+    chunks = chunks[:MAX_CHUNKS]
+    chunk_pages = chunk_pages[:MAX_CHUNKS]
     vectors = []
     for i in range(0, len(chunks), BATCH_SIZE):
         batch = chunks[i:i + BATCH_SIZE]
@@ -230,6 +243,7 @@ def process_upload(uploaded, progress):
         "vectors": arr,
         "texts": np.array(chunks),
         "sources": np.array([uploaded.name] * len(chunks)),
+        "pages": np.array(chunk_pages),
     }, None
 
 
@@ -257,7 +271,15 @@ def generate_with_retry(prompt):
     return None, last_error
 
 
-b_vectors, b_texts, b_sources = load_index()
+def build_history(messages):
+    lines = []
+    for m in messages[-7:-1]:
+        who = "User" if m["role"] == "user" else "Assistant"
+        lines.append(f"{who}: {m['content'][:500]}")
+    return "\n".join(lines) if lines else "(none)"
+
+
+b_vectors, b_texts, b_sources, b_pages = load_index()
 builtin_names = sorted({str(s) for s in b_sources})
 
 if "messages" not in st.session_state:
@@ -359,35 +381,59 @@ if question:
     st.session_state.messages.append(user_msg)
     show_message(user_msg)
 
-    parts_v, parts_t, parts_s = [], [], []
+    parts_v, parts_t, parts_s, parts_p = [], [], [], []
     if custom and scope in ("My uploaded document", "Both"):
         parts_v.append(custom["vectors"])
         parts_t.append(custom["texts"])
         parts_s.append(custom["sources"])
+        parts_p.append(custom["pages"])
     if (not custom) or scope in ("Built-in documents", "Both"):
         parts_v.append(b_vectors)
         parts_t.append(b_texts)
         parts_s.append(b_sources)
+        parts_p.append(b_pages)
     vectors = np.concatenate(parts_v)
     texts = np.concatenate(parts_t)
     source_names = np.concatenate(parts_s)
+    page_numbers = np.concatenate(parts_p)
+
+    previous_questions = [
+        m["content"] for m in st.session_state.messages[:-1] if m["role"] == "user"
+    ]
+    search_text = question
+    if len(question.split()) < 6 and previous_questions:
+        search_text = previous_questions[-1] + " " + question
+    history = build_history(st.session_state.messages)
 
     answer = "Sorry, the AI service did not respond. Please try again in a moment."
     sources = []
     error_note = None
 
     with st.spinner("Searching the documents..."):
-        q, error_note = embed_question(question)
+        q, error_note = embed_question(search_text)
         if q is not None:
             q = q / np.linalg.norm(q)
             scores = vectors @ q
             top = np.argsort(scores)[::-1][:4]
-            context = "\n\n".join(str(texts[i]) for i in top)
-            found = sorted({str(source_names[i]) for i in top})
+
+            context_parts = []
+            found = []
+            for i in top:
+                page = int(page_numbers[i])
+                label = str(source_names[i])
+                if page > 0:
+                    label = f"{label} · p.{page}"
+                context_parts.append(f"[{label}]\n{texts[i]}")
+                if label not in found:
+                    found.append(label)
+            context = "\n\n".join(context_parts)
 
             prompt = (
-                "Answer the question using only the context below. "
-                "If the answer is not in the context, say you don't know.\n\n"
+                "You answer questions about documents. Use only the context "
+                "below. If the answer is not in the context, say you don't "
+                "know. Use the conversation so far to understand follow-up "
+                "questions.\n\n"
+                f"Conversation so far:\n{history}\n\n"
                 f"Context:\n{context}\n\nQuestion: {question}"
             )
             text, error_note = generate_with_retry(prompt)
